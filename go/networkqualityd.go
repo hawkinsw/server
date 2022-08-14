@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
@@ -15,6 +14,8 @@ import (
 	"time"
 
 	_ "net/http/pprof"
+
+	"golang.org/x/net/http2"
 )
 
 var (
@@ -95,14 +96,27 @@ func main() {
 	wg.Add(1)
 
 	listenAddr := fmt.Sprintf("%s:%d", *listenAddr, *configPort)
+
 	go func(listenAddr string) {
+		server := &http.Server{}
+		server.Addr = listenAddr
+		server.Handler = mux
+
+		// Create an http2.Server simply for the purposes of configuring
+		// certain performance-related parameters. Use the
+		// http2.ConfigureServer function to merge the HTTP/2-specific
+		// configuration parameters in to the (generic) HTTP server.
+		http2Configuration := &http2.Server{}
+		http2Configuration.MaxUploadBufferPerConnection = 1 << 27
+		http2Configuration.MaxUploadBufferPerStream = 1 << 27
+		http2.ConfigureServer(server, http2Configuration)
+
 		log.Printf("Network Quality URL: https://%s:%d%s/config", *configName, *configPort, *contextPath)
-		if err := http.ListenAndServeTLS(listenAddr, *certFilename, *keyFilename, mux); err != nil {
+		if err := server.ListenAndServeTLS(*certFilename, *keyFilename); err != nil {
 			log.Fatal(err)
 		}
 		wg.Done()
 	}(listenAddr)
-
 	wg.Wait()
 }
 
@@ -223,6 +237,33 @@ func setNoPublicCache(h http.Header) {
 	h.Set("Cache-Control", "no-store, must-revalidate, private, max-age=0")
 }
 
+// io.Discard reads in to a buffer of 8k which, when used as a parameter
+// to io.Copy when reading the body of an HTTP2 upload, indirectly leads
+// to window update frames being transmitted to the client too frequently.
+// Mimic io.Discard and add a configuration parameter in order to decrease
+// the frequency of HTTP2 window update frames.
+type FlexibleDiscard struct {
+	ChunkSize int
+}
+
+func (fd *FlexibleDiscard) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (fd *FlexibleDiscard) ReadFrom(readable io.Reader) (n int64, err error) {
+	var buf []byte = make([]byte, fd.ChunkSize)
+	var readSize int = 0
+	for {
+		readSize, err = readable.Read(buf)
+		n += int64(readSize)
+		if err == io.EOF {
+			return n, nil
+		} else if err != nil {
+			return
+		}
+	}
+}
+
 // slurpHandler reads the post request and returns JSON with bytes
 // read and how long it took
 func slurpHandler(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +272,11 @@ func slurpHandler(w http.ResponseWriter, r *http.Request) {
 	setNoPublicCache(w.Header())
 
 	t := time.Now()
-	n, err := io.Copy(ioutil.Discard, r.Body)
+	// The hardcoded maximum frame size in go's HTTP2 library is 16k
+	// which means that setting ChunkSize to anything larger that that
+	// will not decrease the rate/quantity of HTTP window update frames.
+	fd := &FlexibleDiscard{ChunkSize: 16 * 1024}
+	n, err := io.Copy(fd, r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
